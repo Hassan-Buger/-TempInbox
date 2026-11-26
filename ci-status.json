@@ -1,0 +1,10 @@
+{
+  "conclusion": "failure",
+  "apk_exists": false,
+  "apk_size_bytes": 0,
+  "variant": "missing",
+  "application_id": "missing",
+  "aapt2_package_line": "",
+  "run_url": "https://github.com/Hassan-Buger/-TempInbox/actions/runs/45826062323",
+  "run_id": 45826062323
+}
