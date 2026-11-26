@@ -1,0 +1,134 @@
+# TempInbox — Android release build (GitHub Actions)
+# Builds the release APK on an x86_64 Ubuntu runner. The Oracle ARM server
+# cannot build this (NDK tools are x86_64-only) and a debug APK is NOT
+# acceptable: it shows the red "Unable to load script" screen because it
+# carries no JS bundle. Only the release APK is a working app.
+name: Android Release Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Binary assets (PNG/WebP icons, Gradle wrapper jar) are stored in
+      # this repo as base64 text files (*.b64) because the push tool only
+      # accepts UTF-8 text. Restore the real bytes before building.
+      - name: Restore binary assets
+        run: |
+          find . -name '*.b64' -print0 | while IFS= read -r -d '' f; do
+            base64 -d "$f" > "${f%.b64}"
+            rm "$f"
+          done
+          test -f assets/icon.png
+          test -f android/gradle/wrapper/gradle-wrapper.jar
+          test -f android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 platforms;android-37 build-tools;36.0.0 build-tools;37.0.0 ndk;27.1.12297006 cmdline-tools;latest'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: true
+
+      # The release build signs with the standard Android debug key
+      # (android/app/build.gradle: signingConfig signingConfigs.debug).
+      # Generate that keystore here instead of committing one.
+      - name: Generate debug keystore
+        run: |
+          keytool -genkey -v -keystore android/app/debug.keystore \
+            -alias androiddebugkey -storepass android -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      # Plain `npm install` / `npm ci` fail on peer-dependency conflicts;
+      # --legacy-peer-deps is required (proven on the Oracle server).
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npx jest
+
+      - name: Build release APK
+        run: cd android && chmod +x gradlew && ./gradlew assembleRelease
+
+      - name: Verify release APK
+        run: |
+          ls -l android/app/build/outputs/apk/release/
+          python3 -c "import json; d=json.load(open('android/app/build/outputs/apk/release/output-metadata.json')); print('variant:', d['variantName']); print('applicationId:', d['applicationId'])"
+          test "$(python3 -c "import json; print(json.load(open('android/app/build/outputs/apk/release/output-metadata.json'))['variantName'])")" = release
+          test "$(python3 -c "import json; print(json.load(open('android/app/build/outputs/apk/release/output-metadata.json'))['applicationId'])")" = com.tempinbox.app
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempinbox-release-apk
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/release/output-metadata.json
+
+      # No Actions API is available to the agent that triggered this run,
+      # so publish a small machine-readable status file to a separate
+      # branch (does not re-trigger this workflow, which only runs on
+      # main). The agent polls this branch for the result.
+      - name: Publish build status
+        if: always()
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          META=android/app/build/outputs/apk/release/output-metadata.json
+          if [ -f "$APK" ]; then
+            SIZE=$(stat -c%s "$APK")
+            VARIANT=$(python3 -c "import json; print(json.load(open('$META'))['variantName'])" 2>/dev/null || echo missing)
+            APPID=$(python3 -c "import json; print(json.load(open('$META'))['applicationId'])" 2>/dev/null || echo missing)
+          else
+            SIZE=0; VARIANT=missing; APPID=missing
+          fi
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 2>/dev/null | sort | tail -1)
+          if [ -f "$APK" ] && [ -n "$AAPT2" ]; then
+            PKG=$("$AAPT2" dump badging "$APK" | head -1)
+          else
+            PKG=""
+          fi
+          cat > ci-status.json <<EOF
+          {
+            "conclusion": "${{ job.status }}",
+            "apk_exists": $([ -f "$APK" ] && echo true || echo false),
+            "apk_size_bytes": $SIZE,
+            "variant": "$VARIANT",
+            "application_id": "$APPID",
+            "aapt2_package_line": "$PKG",
+            "run_url": "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID",
+            "run_id": $GITHUB_RUN_ID
+          }
+          EOF
+          cat ci-status.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin ci-status 2>/dev/null || true
+          git checkout ci-status 2>/dev/null || git checkout --orphan ci-status
+          git add ci-status.json
+          git commit -m "ci: build status for run $GITHUB_RUN_ID [skip ci]" || exit 0
+          git push origin ci-status --force
